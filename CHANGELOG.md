@@ -1,5 +1,23 @@
 # Changelog
 
+## 0.1.1 (2026-04-08)
+
+### Changed
+
+- **Minimum Ruby version raised to 4.0.** Ractor semantics changed
+  significantly in Ruby 4.0, and the test suite no longer passes on
+  3.3. Supporting both would mean carrying two shareability stories,
+  which is not worth it this early in the gem's life.
+
+### Added
+
+- **`test/test_helper.rb`** — silences `Warning[:experimental]` so
+  Ractor tests don't flood stderr, and centralises the `require "rlz4"`
+  for future test files.
+- **Release workflow** (`.github/workflows/release.yml`) — publishes to
+  RubyGems and creates a GitHub release on `v*` tags.
+- **README badges** — gem version, license, Ruby version, Rust.
+
 ## 0.1.0 (2026-04-08)
 
 Initial release.

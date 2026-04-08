@@ -2,7 +2,7 @@
 
 [![Gem Version](https://img.shields.io/gem/v/rlz4?color=e9573f)](https://rubygems.org/gems/rlz4)
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
-[![Ruby](https://img.shields.io/badge/Ruby-%3E%3D%203.1-CC342D?logo=ruby&logoColor=white)](https://www.ruby-lang.org)
+[![Ruby](https://img.shields.io/badge/Ruby-%3E%3D%204.0-CC342D?logo=ruby&logoColor=white)](https://www.ruby-lang.org)
 [![Rust](https://img.shields.io/badge/Rust-stable-dea584?logo=rust&logoColor=white)](https://www.rust-lang.org)
 
 Ractor-safe LZ4 bindings for Ruby, built as a Rust extension on top of
