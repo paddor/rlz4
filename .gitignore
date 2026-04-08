@@ -1,0 +1,8 @@
+/Gemfile.lock
+/pkg/
+/coverage/
+/target/
+/lib/**/*.so
+/tmp/
+*.gem
+/TODO

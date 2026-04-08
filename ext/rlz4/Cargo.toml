@@ -1,0 +1,16 @@
+[package]
+name    = "rlz4"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+name       = "rlz4"
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+lz4_flex = { version = "0.13", default-features = false, features = ["frame", "std", "safe-encode", "safe-decode"] }
+magnus   = "0.8"
+rb-sys   = "0.9"
+
+[build-dependencies]
+rb-sys = "0.9"
