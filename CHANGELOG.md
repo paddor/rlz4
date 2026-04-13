@@ -1,5 +1,33 @@
 # Changelog
 
+## 0.2.0 (2026-04-12)
+
+### Breaking
+
+- **`RLZ4::Dictionary` wire format changed.** `Dictionary#compress` now
+  emits a real LZ4 frame (magic `04 22 4D 18`) with the FLG.DictID bit
+  set and `Dict_ID` written into the FrameDescriptor, instead of the
+  proprietary `size_le_u32 || lz4_block` blob used in 0.1.x. Output is
+  interoperable with the reference `lz4` CLI when both sides use the
+  same dictionary file (`lz4 -d -D dict.bin`). Bytes produced by 0.1.x
+  cannot be decoded by 0.2.x and vice versa.
+
+### Added
+
+- **`RLZ4::Dictionary#id`** — `u32` derived from `sha256(dict)[0..4]`
+  interpreted little-endian. This is the value written into every
+  emitted frame's `Dict_ID`, and the value `Dictionary#decompress`
+  asserts the incoming frame declares before decoding. A peer that
+  encodes against the wrong dictionary now fails fast with a
+  `DecompressError` instead of returning corrupt bytes.
+
+### Internal
+
+- Backed by a fork of `lz4_flex` (`frame-dict-support` branch) that
+  adds `FrameEncoder::with_dictionary` / `FrameDecoder::with_dictionary`.
+  Tracked as a path dependency until upstream merges
+  <https://github.com/PSeitz/lz4_flex> PR.
+
 ## 0.1.1 (2026-04-08)
 
 ### Changed

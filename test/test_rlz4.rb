@@ -106,6 +106,24 @@ describe RLZ4 do
       assert_equal dict.bytesize, d.size
     end
 
+    it "exposes a stable Dict_ID derived from sha256(dict)[0..4] LE" do
+      require "digest"
+      expected = Digest::SHA256.digest(dict)[0, 4].unpack1("V")
+      assert_equal expected, d.id
+      assert_equal d.id, RLZ4::Dictionary.new(dict.dup).id
+    end
+
+    it "emits a real LZ4 frame with the magic number" do
+      ct = d.compress("header version=1 type=message field1=hello")
+      assert_equal [0x04, 0x22, 0x4D, 0x18], ct.bytes.first(4)
+    end
+
+    it "raises DecompressError on dict id mismatch" do
+      d2  = RLZ4::Dictionary.new("totally different dictionary payload")
+      ct  = d.compress("header version=1 type=message field1=hello")
+      assert_raises(RLZ4::DecompressError) { d2.decompress(ct) }
+    end
+
     it "round-trips a message that shares the dict prefix" do
       msg = "header version=1 type=message field1=hello world"
       ct  = d.compress(msg)
@@ -122,18 +140,6 @@ describe RLZ4 do
       assert_equal "", d.decompress(ct)
     end
 
-    it "does not round-trip with a different dict" do
-      d2  = RLZ4::Dictionary.new("totally different dictionary payload")
-      msg = "header version=1 type=message field1=hello"
-      ct  = d.compress(msg)
-      # Either raises or returns wrong bytes — but must not silently succeed.
-      begin
-        got = d2.decompress(ct)
-        refute_equal msg, got
-      rescue RLZ4::DecompressError
-        # acceptable
-      end
-    end
 
     it "raises DecompressError on garbage input" do
       assert_raises(RLZ4::DecompressError) { d.decompress("garbage") }
