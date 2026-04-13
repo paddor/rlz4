@@ -8,7 +8,7 @@ name       = "rlz4"
 crate-type = ["cdylib", "rlib"]
 
 [dependencies]
-lz4_flex = { path = "../../../lz4_flex", default-features = false, features = ["frame", "std", "safe-encode", "safe-decode"] }
+lz4_flex = { git = "https://github.com/paddor/lz4_flex.git", rev = "dae9c784e890591e6445135ba23cacf344eafe8f", default-features = false, features = ["frame", "std", "safe-encode", "safe-decode"] }
 magnus   = "0.8"
 rb-sys   = "0.9"
 

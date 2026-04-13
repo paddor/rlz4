@@ -107,6 +107,7 @@ dependencies = [
 [[package]]
 name = "lz4_flex"
 version = "0.13.0"
+source = "git+https://github.com/paddor/lz4_flex.git?rev=dae9c784e890591e6445135ba23cacf344eafe8f#dae9c784e890591e6445135ba23cacf344eafe8f"
 dependencies = [
  "twox-hash",
 ]
