@@ -55,9 +55,10 @@ end
 
 For workloads where many small messages share a common prefix (e.g. ZMQ
 messages with a fixed header), a shared dictionary massively improves the
-compression ratio. `RLZ4::Dictionary` uses LZ4 **block** format with the
-original size prepended — this is a different wire format from
-`RLZ4.compress` and is not interoperable with it.
+compression ratio. `RLZ4::Dictionary#compress` emits a **real LZ4 frame**
+(magic `04 22 4D 18`) with the `FLG.DictID` bit set and the dictionary's
+`Dict_ID` written into the FrameDescriptor — interoperable with the
+reference `lz4` CLI given the same dictionary file (`lz4 -d -D dict.bin`).
 
 ```ruby
 dict = RLZ4::Dictionary.new("schema=v1 type=message field1=")
@@ -66,10 +67,38 @@ compressed   = dict.compress("schema=v1 type=message field1=payload")
 decompressed = dict.decompress(compressed)
 
 dict.size  # => 30
+dict.id    # => u32 Dict_ID
 ```
 
 `RLZ4::Dictionary` is immutable after construction and can be shared across
 Ractors.
+
+## Dictionary IDs
+
+`Dictionary#id` is a `u32` derived from `sha256(dict_bytes)[0..4]`
+interpreted little-endian. The LZ4 frame spec defines `Dict_ID` as
+an application-defined field with no reserved ranges and no central
+registrar, so the full `u32` space is usable.
+
+The id **is on the wire**: `Dictionary#compress` sets `FLG.DictID = 1`
+and writes the id into the FrameDescriptor. On decode, `rlz4` parses
+the incoming frame's `Dict_ID` and asserts it matches
+`Dictionary#id` before touching the payload. Receivers that maintain
+multiple dictionaries can therefore route incoming frames to the
+right one purely by parsing the frame header — no out-of-band id
+channel needed.
+
+LZ4 dictionaries are always raw bytes (unlike Zstd, there is no
+dict-file header format), so there is no header to parse an id out
+of. If you need sender and receiver to agree on an id without
+shipping it out-of-band, deriving it deterministically from the
+dict bytes — which is what `Dictionary.new` does — is the simplest
+option.
+
+Dictionary training from a sample corpus is **not supported**: LZ4
+has no equivalent of Zstd's `ZDICT_trainFromBuffer`. Dictionaries
+are supplied by the caller as raw bytes (typically a hand-picked
+prefix or a representative message).
 
 ### Ractors
 

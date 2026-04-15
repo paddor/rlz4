@@ -1,5 +1,22 @@
 # Changelog
 
+## 0.2.1 (2026-04-15)
+
+### Docs
+
+- **README: corrected the `RLZ4::Dictionary` section** that still
+  claimed dict compression used "LZ4 block format with the original
+  size prepended". Since 0.2.0, `Dictionary#compress` has actually
+  emitted a real LZ4 frame with the `FLG.DictID` bit set and
+  `Dict_ID` written into the FrameDescriptor — the README just
+  never caught up.
+- **New "Dictionary IDs" section** explaining that the `Dict_ID`
+  `Dictionary#id` computes is the same one that rides along in
+  every emitted frame's FrameDescriptor, so receivers with multiple
+  dictionaries can route incoming frames purely by parsing the
+  frame header. Also documents that dict training from samples is
+  not supported (LZ4 has no ZDICT equivalent).
+
 ## 0.2.0 (2026-04-12)
 
 ### Breaking
