@@ -34,22 +34,67 @@ Building requires a Rust toolchain (stable).
 ```ruby
 require "rlz4"
 
-compressed   = RLZ4.compress("hello world" * 100)
-decompressed = RLZ4.decompress(compressed)
+compressed   = RLZ4.compress_frame("hello world" * 100)
+decompressed = RLZ4.decompress_frame(compressed)
 
 # Wire format is standard LZ4 frame (magic number 04 22 4D 18),
 # interoperable with any other LZ4 frame implementation.
 ```
 
+`RLZ4.compress` / `RLZ4.decompress` are kept as aliases for
+`compress_frame` / `decompress_frame` and will be removed in 0.4.
+
 Invalid input raises `RLZ4::DecompressError` (a `StandardError` subclass):
 
 ```ruby
 begin
-  RLZ4.decompress("not a valid lz4 frame")
+  RLZ4.decompress_frame("not a valid lz4 frame")
 rescue RLZ4::DecompressError => e
   warn e.message
 end
 ```
+
+### Block format (stateful codec)
+
+For hot paths that compress many small messages and want to amortise
+allocation, use `RLZ4::BlockCodec`. It wraps a reusable scratch hash
+table and emits raw LZ4 blocks — no frame header, no end-mark, no
+checksum. Not interoperable with the reference `lz4` CLI, meant for
+callers who carry their own framing (e.g. ZMTP transports).
+
+```ruby
+codec = RLZ4::BlockCodec.new
+
+msg = "small message " * 8
+ct  = codec.compress(msg)
+pt  = codec.decompress(ct, decompressed_size: msg.bytesize)
+```
+
+For a **shared dictionary**, pass it at construction time. The dict
+is hashed into a pristine table exactly once; every subsequent
+`#compress` call restores the pristine state via a 16 KiB `memcpy`.
+This amortises dict initialisation across the codec's lifetime
+instead of paying ~3–5 µs per call to re-hash the dict.
+
+```ruby
+codec = RLZ4::BlockCodec.new(dict: "common log prefix: ")
+ct = codec.compress("common log prefix: event=login user=alice")
+pt = codec.decompress(ct, decompressed_size: ct.bytesize)
+```
+
+The dict is a permanent property of the codec. To change dicts, build
+a fresh codec. The peer on the other end must construct its codec
+with the same dict bytes.
+
+`#decompress` requires `decompressed_size:` because raw LZ4 blocks
+carry no length prefix, and uses it as a hard upper bound on output
+size. Crafted inputs that try to write more than `decompressed_size`
+raise `RLZ4::DecompressError`.
+
+Use `RLZ4.compress_bound(n)` to pre-size output buffers.
+
+`BlockCodec` is thread-local — **do not cross `Ractor` boundaries**.
+Allocate one codec per `Ractor`.
 
 ### Dictionary compression
 
@@ -102,16 +147,17 @@ prefix or a representative message).
 
 ### Ractors
 
-Both the module functions and `RLZ4::Dictionary` can be used from any
-Ractor. Example from the test suite:
+Module functions and `RLZ4::Dictionary` can be used from any Ractor.
+**`RLZ4::BlockCodec` cannot cross Ractor boundaries** — allocate one
+per Ractor. Example from the test suite:
 
 ```ruby
 ractors = 4.times.map do |i|
   Ractor.new(i) do |idx|
     pt = "ractor #{idx} payload " * 1000
     1000.times do
-      ct = RLZ4.compress(pt)
-      raise "mismatch" unless RLZ4.decompress(ct) == pt
+      ct = RLZ4.compress_frame(pt)
+      raise "mismatch" unless RLZ4.decompress_frame(ct) == pt
     end
     :ok
   end

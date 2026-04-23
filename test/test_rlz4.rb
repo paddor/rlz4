@@ -154,6 +154,248 @@ describe RLZ4 do
     end
   end
 
+  describe ".compress_bound" do
+    it "is monotonic in input size" do
+      a = RLZ4.compress_bound(100)
+      b = RLZ4.compress_bound(1_000)
+      c = RLZ4.compress_bound(1_000_000)
+      assert_operator a, :<, b
+      assert_operator b, :<, c
+    end
+
+    it "is large enough to hold real compressor output for random input" do
+      codec = RLZ4::BlockCodec.new
+      [0, 1, 100, 4096, 100_000].each do |n|
+        pt    = Random.bytes(n)
+        bound = RLZ4.compress_bound(n)
+        ct    = codec.compress(pt)
+        assert_operator ct.bytesize, :<=, bound,
+          "compress_bound(#{n}) = #{bound} must hold #{ct.bytesize} bytes of ciphertext"
+      end
+    end
+  end
+
+  describe RLZ4::BlockCodec do
+    describe "no-dict codec" do
+      let(:codec) { RLZ4::BlockCodec.new }
+
+      it "reports has_dict? = false" do
+        refute_predicate codec, :has_dict?
+      end
+
+      it "round-trips an empty string" do
+        ct = codec.compress("")
+        assert_equal "", codec.decompress(ct, decompressed_size: 0)
+      end
+
+      it "round-trips ASCII text" do
+        pt = "the quick brown fox jumps over the lazy dog"
+        ct = codec.compress(pt)
+        assert_equal pt, codec.decompress(ct, decompressed_size: pt.bytesize)
+      end
+
+      it "round-trips highly repetitive input and actually compresses" do
+        pt = "A" * 100_000
+        ct = codec.compress(pt)
+        assert_operator ct.bytesize, :<, pt.bytesize / 100
+        assert_equal pt, codec.decompress(ct, decompressed_size: pt.bytesize)
+      end
+
+      it "round-trips across size buckets" do
+        [0, 1, 12, 13, 64, 255, 256, 1024, 4096, 65_536, 1_048_576].each do |n|
+          pt = Random.bytes(n)
+          ct = codec.compress(pt)
+          assert_equal pt, codec.decompress(ct, decompressed_size: n),
+            "round-trip failed at size #{n}"
+        end
+      end
+
+      it "emits binary-encoded output" do
+        ct = codec.compress("hello")
+        assert_equal Encoding::ASCII_8BIT, ct.encoding
+      end
+
+      it "reuses the scratch table across many calls" do
+        # If the table were not properly cleared, earlier inputs would bleed
+        # into later ciphertexts and round-trip would break.
+        500.times do |i|
+          pt = "message #{i} " * (1 + i % 10)
+          ct = codec.compress(pt)
+          assert_equal pt, codec.decompress(ct, decompressed_size: pt.bytesize)
+        end
+      end
+
+      it "reports its size as one 16 KiB table" do
+        assert_equal 16_384, codec.size
+      end
+    end
+
+    describe "dict codec" do
+      let(:dict)  { "JSON field prefix: version=1 type=event data=" }
+      let(:codec) { RLZ4::BlockCodec.new(dict: dict) }
+
+      it "reports has_dict? = true" do
+        assert_predicate codec, :has_dict?
+      end
+
+      it "round-trips" do
+        msg = "JSON field prefix: version=1 type=event data=hello"
+        ct  = codec.compress(msg)
+        assert_equal msg, codec.decompress(ct, decompressed_size: msg.bytesize)
+      end
+
+      it "decodes with a separate receiver codec constructed with the same dict" do
+        msg = "JSON field prefix: version=1 type=event data=world"
+        ct  = codec.compress(msg)
+        receiver = RLZ4::BlockCodec.new(dict: dict)
+        assert_equal msg, receiver.decompress(ct, decompressed_size: msg.bytesize)
+      end
+
+      it "compresses dict-sharing input better than without dict" do
+        msg        = "JSON field prefix: version=1 type=event data=x"
+        ct_with    = codec.compress(msg)
+        ct_without = RLZ4::BlockCodec.new.compress(msg)
+        assert_operator ct_with.bytesize, :<, ct_without.bytesize
+      end
+
+      it "round-trips across size buckets" do
+        [0, 1, 64, 1024, 65_536].each do |n|
+          pt = Random.bytes(n)
+          ct = codec.compress(pt)
+          assert_equal pt, codec.decompress(ct, decompressed_size: n),
+            "round-trip failed at size #{n}"
+        end
+      end
+
+      it "round-trips 500 times in a row (pristine table is not clobbered)" do
+        # The per-call memcpy from pristine→scratch must restore state
+        # exactly — otherwise successive calls would drift.
+        msgs = 500.times.map { |i| "JSON field prefix: version=1 type=event data=#{i}" }
+        ciphertexts = msgs.map { |m| codec.compress(m) }
+        msgs.zip(ciphertexts).each do |msg, ct|
+          assert_equal msg, codec.decompress(ct, decompressed_size: msg.bytesize)
+        end
+      end
+
+      it "reports its size as two 16 KiB tables plus dict bytes" do
+        assert_equal 16_384 + 16_384 + dict.bytesize, codec.size
+      end
+    end
+
+    describe "bounded decompression" do
+      let(:codec) { RLZ4::BlockCodec.new }
+
+      it "refuses to write past decompressed_size" do
+        pt = "X" * 10_000
+        ct = codec.compress(pt)
+        # Lie and say the output is tiny. Must fail, not segfault or truncate.
+        assert_raises(RLZ4::DecompressError) do
+          codec.decompress(ct, decompressed_size: 100)
+        end
+      end
+
+      it "raises DecompressError on garbage input" do
+        # A token claiming 200 literals in a 1-byte buffer is unambiguously
+        # malformed: the literal payload can't be read. Note that many short
+        # byte sequences are accidentally valid LZ4 blocks (e.g. "garbage"
+        # parses as token-6-literals + 6 literal bytes), so the test input
+        # has to be crafted to fail a specific invariant.
+        malformed = "\xFF".b
+        assert_raises(RLZ4::DecompressError) do
+          codec.decompress(malformed, decompressed_size: 100)
+        end
+      end
+
+      it "raises DecompressError on truncated ciphertext" do
+        pt = "X" * 10_000
+        ct = codec.compress(pt)
+        assert_raises(RLZ4::DecompressError) do
+          codec.decompress(ct[0, ct.bytesize / 2], decompressed_size: pt.bytesize)
+        end
+      end
+
+      it "survives a fuzz of 10k random inputs without crashing" do
+        # Plan exit criterion: decompress refuses to write past
+        # decompressed_size even on crafted malformed input, and must
+        # never segfault or OOM across 10k mutated inputs.
+        srand(0xC0DEC)
+        10_000.times do
+          len = rand(1..1024)
+          blob = Random.bytes(len)
+          decompressed_size = rand(0..16_384)
+          begin
+            codec.decompress(blob, decompressed_size: decompressed_size)
+          rescue RLZ4::DecompressError
+            # expected
+          end
+        end
+      end
+
+      it "survives a fuzz of 10k mutated valid ciphertexts" do
+        # Mutating known-valid ciphertexts is a more effective fuzz for the
+        # decoder state machine than random bytes, which mostly flunk the
+        # very first token check.
+        srand(0xFA11B1)
+        pt = "the quick brown fox jumps over the lazy dog " * 64
+        valid = codec.compress(pt)
+        10_000.times do
+          mutated = valid.dup
+          # Flip a random byte (or a few).
+          1.upto(rand(1..3)) do
+            i = rand(mutated.bytesize)
+            mutated.setbyte(i, rand(256))
+          end
+          begin
+            codec.decompress(mutated, decompressed_size: pt.bytesize)
+          rescue RLZ4::DecompressError
+            # expected for most mutations
+          end
+        end
+      end
+    end
+
+    describe "wrong-dict decode" do
+      # LZ4 block format has no built-in dict id or checksum. Decoding a
+      # dict-compressed message with the wrong dict may raise (if the
+      # garbage violates the block state machine) or may silently produce
+      # corrupted output. What matters is: no segfault, no out-of-bounds
+      # write, no OOM.
+      let(:dict_a) { ("header version=1 type=message field=" * 3).b }
+      let(:dict_b) { ("totally different dictionary payload here " * 3).b }
+
+      it "does not crash when decoding with the wrong dict" do
+        sender   = RLZ4::BlockCodec.new(dict: dict_a)
+        receiver = RLZ4::BlockCodec.new(dict: dict_b)
+        msg = "header version=1 type=message field=hello"
+        ct  = sender.compress(msg)
+
+        # Either raises DecompressError or produces garbage; must not crash.
+        # Output buffer is bounded to msg.bytesize; a wrong-dict decode
+        # that tries to reach past it raises.
+        begin
+          out = receiver.decompress(ct, decompressed_size: msg.bytesize)
+          refute_equal msg, out, "wrong-dict decode surprisingly produced the correct plaintext"
+        rescue RLZ4::DecompressError
+          # also fine
+        end
+      end
+
+      it "does not crash when decoding without a dict that was dict-compressed" do
+        sender   = RLZ4::BlockCodec.new(dict: dict_a)
+        receiver = RLZ4::BlockCodec.new  # no dict
+        msg = "header version=1 type=message field=hello"
+        ct  = sender.compress(msg)
+
+        begin
+          out = receiver.decompress(ct, decompressed_size: msg.bytesize)
+          refute_equal msg, out
+        rescue RLZ4::DecompressError
+          # also fine
+        end
+      end
+    end
+  end
+
   describe "Ractor safety" do
     it "compresses and decompresses inside a Ractor" do
       r = Ractor.new do
@@ -176,6 +418,26 @@ describe RLZ4 do
         d.decompress(ct) == msg
       end
       assert_equal true, r.value
+    end
+
+    it "BlockCodec is per-Ractor (each Ractor allocates its own)" do
+      r = Ractor.new do
+        c   = RLZ4::BlockCodec.new
+        msg = "ractor local payload " * 50
+        ct  = c.compress(msg)
+        c.decompress(ct, decompressed_size: msg.bytesize) == msg
+      end
+      assert_equal true, r.value
+    end
+
+    it "BlockCodec cannot cross Ractor boundaries" do
+      codec = RLZ4::BlockCodec.new
+      # Sending a non-shareable BlockCodec into a Ractor must raise. magnus
+      # exposes this as "allocator undefined" via TypeError at Ractor.new
+      # time; the exact class matters less than "not a silent success".
+      assert_raises(TypeError, Ractor::IsolationError) do
+        Ractor.new(codec) { |c| c.compress("payload") }
+      end
     end
 
     it "multiple Ractors compress in parallel without crashing" do

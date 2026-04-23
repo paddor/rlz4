@@ -6,9 +6,14 @@ use magnus::{
     value::Opaque,
     Error, Ruby,
 };
+use std::cell::RefCell;
 use std::io::{Read, Write};
 use std::sync::OnceLock;
 
+use lz4_flex::block::{
+    compress_into_with_loaded_table_and_dict, compress_into_with_table, decompress_into,
+    decompress_into_with_dict, get_maximum_output_size, CompressTable,
+};
 use lz4_flex::frame::{FrameDecoder, FrameEncoder};
 
 const LZ4_FRAME_MAGIC: [u8; 4] = [0x04, 0x22, 0x4d, 0x18];
@@ -25,16 +30,23 @@ fn decompress_error(ruby: &Ruby) -> ExceptionClass {
 }
 
 // ---------- module functions: frame-format compress/decompress ----------
+//
+// These are the v0.1/v0.2 API, renamed in 0.3 to `compress_frame` /
+// `decompress_frame` to make room for block-format primitives on the
+// module surface. The old names are kept as aliases for one release
+// cycle.
 
-fn rlz4_compress(ruby: &Ruby, rb_input: RString) -> Result<RString, Error> {
-    // SAFETY: copy borrowed bytes into an owned Vec before any Ruby allocation.
-    let input: Vec<u8> = unsafe { rb_input.as_slice().to_vec() };
+fn rlz4_compress_frame(ruby: &Ruby, rb_input: RString) -> Result<RString, Error> {
+    // SAFETY: borrow the RString's bytes directly. Ruby GC won't move
+    // `rb_input` during this function; `FrameEncoder::write_all` /
+    // `finish` allocate Rust Vecs only, no Ruby callbacks.
+    let input: &[u8] = unsafe { rb_input.as_slice() };
 
     // Pre-size the output buffer. Frame overhead is ~19 bytes for the header
     // plus up to ~4 bytes per block end-marker — 64 is a comfortable ceiling.
-    let upper = lz4_flex::block::get_maximum_output_size(input.len()) + 64;
+    let upper = get_maximum_output_size(input.len()) + 64;
     let mut encoder = FrameEncoder::new(Vec::with_capacity(upper));
-    encoder.write_all(&input).map_err(|e| {
+    encoder.write_all(input).map_err(|e| {
         Error::new(
             ruby.exception_runtime_error(),
             format!("lz4 frame encoder write failed: {e}"),
@@ -50,9 +62,9 @@ fn rlz4_compress(ruby: &Ruby, rb_input: RString) -> Result<RString, Error> {
     Ok(ruby.str_from_slice(&compressed))
 }
 
-fn rlz4_decompress(ruby: &Ruby, rb_input: RString) -> Result<RString, Error> {
-    // SAFETY: copy borrowed bytes before any Ruby allocation.
-    let compressed: Vec<u8> = unsafe { rb_input.as_slice().to_vec() };
+fn rlz4_decompress_frame(ruby: &Ruby, rb_input: RString) -> Result<RString, Error> {
+    // SAFETY: borrow the RString's bytes directly. See rlz4_compress_frame.
+    let compressed: &[u8] = unsafe { rb_input.as_slice() };
 
     // Reject anything that isn't a well-formed frame up front. lz4_flex's
     // FrameDecoder permissively returns Ok for zero-length input, which would
@@ -66,7 +78,7 @@ fn rlz4_decompress(ruby: &Ruby, rb_input: RString) -> Result<RString, Error> {
 
     // Decode into a local Vec first. If this fails, we never allocate a
     // Ruby string — important for DoS-resistance against malformed input.
-    let mut decoder = FrameDecoder::new(&compressed[..]);
+    let mut decoder = FrameDecoder::new(compressed);
     let mut out = Vec::new();
     decoder.read_to_end(&mut out).map_err(|e| {
         Error::new(
@@ -75,6 +87,147 @@ fn rlz4_decompress(ruby: &Ruby, rb_input: RString) -> Result<RString, Error> {
         )
     })?;
 
+    Ok(ruby.str_from_slice(&out))
+}
+
+fn rlz4_compress_bound(_ruby: &Ruby, size: usize) -> Result<usize, Error> {
+    Ok(get_maximum_output_size(size))
+}
+
+// ---------- BlockCodec: reusable LZ4 block-format scratch ----------
+//
+// Wraps lz4_flex's CompressTable. A codec constructed without a dict
+// carries one scratch table (cleared per compress call). A codec
+// constructed with a dict also carries a pristine table populated with
+// dict positions once via `load_dict`; before each compress call the
+// scratch table is overwritten from the pristine table with a single
+// memcpy. This avoids the ~3–5 µs per-call `init_dict` cost that a naive
+// "hash the dict on every call" approach would incur.
+//
+// Decompression ignores the tables (LZ4 block decoding needs no scratch);
+// it lives on the same class so callers hold one object per worker
+// instead of two.
+//
+// Thread-local by construction (RefCell, no Send+Sync). A BlockCodec must
+// not cross Ractor boundaries — send a new one instead.
+
+struct DictState {
+    bytes: Vec<u8>,
+    pristine: CompressTable,
+}
+
+#[magnus::wrap(class = "RLZ4::BlockCodec", free_immediately, size)]
+struct BlockCodec {
+    scratch: RefCell<CompressTable>,
+    dict: Option<DictState>,
+}
+
+fn block_codec_new(_ruby: &Ruby, rb_dict: Option<RString>) -> Result<BlockCodec, Error> {
+    // Large table: 4096 × u32 entries = 16 KiB. Covers any input size without
+    // the transparent upgrade path taken by Small. Predictable footprint is
+    // more important than the ~8 KiB saving for short-message workloads.
+    let scratch = RefCell::new(CompressTable::large());
+
+    let dict = match rb_dict {
+        None => None,
+        Some(rb_dict) => {
+            // SAFETY: copy dict bytes into an owned Vec before any Ruby
+            // allocation. The dict lives for the codec's lifetime.
+            let bytes: Vec<u8> = unsafe { rb_dict.as_slice().to_vec() };
+            let mut pristine = CompressTable::large();
+            pristine.load_dict(&bytes);
+            Some(DictState { bytes, pristine })
+        }
+    };
+
+    Ok(BlockCodec { scratch, dict })
+}
+
+fn block_codec_size(rb_self: &BlockCodec) -> usize {
+    // 4096 entries × 4 bytes = 16 KiB for the scratch table, plus another
+    // 16 KiB for the pristine table if a dict is installed, plus the dict
+    // bytes themselves.
+    let base = 16 * 1024;
+    match &rb_self.dict {
+        None => base,
+        Some(d) => base + 16 * 1024 + d.bytes.len(),
+    }
+}
+
+fn block_codec_has_dict(rb_self: &BlockCodec) -> bool {
+    rb_self.dict.is_some()
+}
+
+fn block_codec_compress(
+    ruby: &Ruby,
+    rb_self: &BlockCodec,
+    rb_input: RString,
+) -> Result<RString, Error> {
+    // SAFETY: borrow the RString's bytes directly, skipping the
+    // customary copy-to-Vec. Valid because:
+    //   (a) `rb_input` is a stack-pinned argument — the Ruby GC won't
+    //       collect or move it while this function runs.
+    //   (b) lz4_flex's block compress does no callbacks into Ruby and
+    //       no allocations that could trigger Ruby GC — it only
+    //       allocates Rust Vecs via the global allocator.
+    //   (c) The Ruby string allocation (`str_from_slice`) happens
+    //       strictly after the input slice is no longer in use.
+    // Saves one input-sized memcpy per call (~1 KiB / ~10ns-100ns).
+    let input: &[u8] = unsafe { rb_input.as_slice() };
+
+    let upper = get_maximum_output_size(input.len());
+    let mut out = vec![0u8; upper];
+
+    let mut scratch = rb_self.scratch.borrow_mut();
+    let compressed_len = match &rb_self.dict {
+        None => compress_into_with_table(input, &mut out, &mut scratch),
+        Some(d) => {
+            // Restore the scratch table to the pristine dict-loaded state.
+            // This is one 16 KiB memcpy — ~50× cheaper than re-hashing the
+            // dict into a cleared table.
+            scratch.copy_from(&d.pristine);
+            compress_into_with_loaded_table_and_dict(input, &mut out, &mut scratch, &d.bytes)
+        }
+    }
+    .map_err(|e| {
+        Error::new(
+            ruby.exception_runtime_error(),
+            format!("lz4 block compress failed: {e}"),
+        )
+    })?;
+
+    out.truncate(compressed_len);
+    Ok(ruby.str_from_slice(&out))
+}
+
+fn block_codec_decompress(
+    ruby: &Ruby,
+    rb_self: &BlockCodec,
+    rb_input: RString,
+    decompressed_size: usize,
+) -> Result<RString, Error> {
+    // SAFETY: see block_codec_compress. Same reasoning: decoder is pure
+    // Rust, no Ruby callbacks, no Ruby allocations until `str_from_slice`.
+    let compressed: &[u8] = unsafe { rb_input.as_slice() };
+
+    // Pre-size the output buffer to the caller-supplied decompressed_size.
+    // `decompress_into` refuses to write past this boundary (OutputTooSmall),
+    // which bounds the DoS window: a malicious sender who lies about
+    // decompressed_size gets capped at whatever the caller allowed.
+    let mut out = vec![0u8; decompressed_size];
+
+    let actual_len = match &rb_self.dict {
+        None => decompress_into(compressed, &mut out),
+        Some(d) => decompress_into_with_dict(compressed, &mut out, &d.bytes),
+    }
+    .map_err(|e| {
+        Error::new(
+            decompress_error(ruby),
+            format!("lz4 block decode failed: {e}"),
+        )
+    })?;
+
+    out.truncate(actual_len);
     Ok(ruby.str_from_slice(&out))
 }
 
@@ -109,14 +262,15 @@ fn dict_initialize(_ruby: &Ruby, rb_dict: RString, id: u32) -> Result<Dictionary
 }
 
 fn dict_compress(ruby: &Ruby, rb_self: &Dictionary, rb_input: RString) -> Result<RString, Error> {
-    let input: Vec<u8> = unsafe { rb_input.as_slice().to_vec() };
-    let upper = lz4_flex::block::get_maximum_output_size(input.len()) + 64;
+    // SAFETY: borrow the RString's bytes directly. See rlz4_compress_frame.
+    let input: &[u8] = unsafe { rb_input.as_slice() };
+    let upper = get_maximum_output_size(input.len()) + 64;
     let mut encoder = lz4_flex::frame::FrameEncoder::with_dictionary(
         Vec::with_capacity(upper),
         &rb_self.bytes,
         rb_self.id,
     );
-    encoder.write_all(&input).map_err(|e| {
+    encoder.write_all(input).map_err(|e| {
         Error::new(
             ruby.exception_runtime_error(),
             format!("lz4 dict frame encode write failed: {e}"),
@@ -136,7 +290,8 @@ fn dict_decompress(
     rb_self: &Dictionary,
     rb_input: RString,
 ) -> Result<RString, Error> {
-    let compressed: Vec<u8> = unsafe { rb_input.as_slice().to_vec() };
+    // SAFETY: borrow the RString's bytes directly. See rlz4_compress_frame.
+    let compressed: &[u8] = unsafe { rb_input.as_slice() };
     if compressed.len() < LZ4_FRAME_MAGIC.len() || compressed[..4] != LZ4_FRAME_MAGIC {
         return Err(Error::new(
             decompress_error(ruby),
@@ -145,7 +300,7 @@ fn dict_decompress(
     }
 
     let mut decoder = lz4_flex::frame::FrameDecoder::with_dictionary(
-        &compressed[..],
+        compressed,
         &rb_self.bytes,
         rb_self.id,
     );
@@ -171,10 +326,10 @@ fn dict_id(rb_self: &Dictionary) -> u32 {
 
 #[magnus::init]
 fn init(ruby: &Ruby) -> Result<(), Error> {
-    // Mark this extension as Ractor-safe. All our Rust code uses only
-    // stack/owned data, holds no globals aside from the Opaque exception
-    // class (which is Send+Sync by construction), and the Dictionary type
-    // is read-only after init, so it is safe to call from any Ractor.
+    // Mark this extension as Ractor-safe for module-level and Dictionary
+    // operations. BlockCodec uses a RefCell internally and must not cross
+    // Ractor boundaries — the Ruby wrapper documents this and doesn't
+    // implement `Ractor.make_shareable`.
     unsafe { rb_sys::rb_ext_ractor_safe(true) };
 
     let module = ruby.define_module("RLZ4")?;
@@ -185,8 +340,22 @@ fn init(ruby: &Ruby) -> Result<(), Error> {
         .set(Opaque::from(decompress_error_class))
         .unwrap_or_else(|_| panic!("init called more than once"));
 
-    module.define_module_function("compress", function!(rlz4_compress, 1))?;
-    module.define_module_function("decompress", function!(rlz4_decompress, 1))?;
+    // Frame-format module functions (renamed in 0.3; old names kept as
+    // aliases in lib/rlz4.rb for one release cycle).
+    module.define_module_function("compress_frame", function!(rlz4_compress_frame, 1))?;
+    module.define_module_function("decompress_frame", function!(rlz4_decompress_frame, 1))?;
+    module.define_module_function("compress_bound", function!(rlz4_compress_bound, 1))?;
+
+    // Block-format codec: stateful encoder (reusable scratch table, with
+    // an optional dict-loaded pristine table for per-call memcpy restore).
+    // Decompression is stateless but lives on the same class for
+    // one-object-per-worker ergonomics.
+    let codec_class = module.define_class("BlockCodec", ruby.class_object())?;
+    codec_class.define_singleton_method("_native_new", function!(block_codec_new, 1))?;
+    codec_class.define_method("size", method!(block_codec_size, 0))?;
+    codec_class.define_method("has_dict?", method!(block_codec_has_dict, 0))?;
+    codec_class.define_method("compress", method!(block_codec_compress, 1))?;
+    codec_class.define_method("_decompress", method!(block_codec_decompress, 2))?;
 
     let dict_class = module.define_class("Dictionary", ruby.class_object())?;
     // Bound as `_native_new(bytes, id)`. Ruby's `RLZ4::Dictionary.new(bytes)`
@@ -273,5 +442,51 @@ mod tests {
             lz4_flex::frame::FrameDecoder::with_dictionary(&*ct, &dict_b, 0xBBBB_BBBB);
         let mut out = Vec::new();
         assert!(dec.read_to_end(&mut out).is_err());
+    }
+
+    #[test]
+    fn block_table_round_trip() {
+        let mut table = CompressTable::large();
+        let msg = b"hello hello hello hello".to_vec();
+        let mut out = vec![0u8; get_maximum_output_size(msg.len())];
+        let n = compress_into_with_table(&msg, &mut out, &mut table).unwrap();
+
+        let mut decoded = vec![0u8; msg.len()];
+        let d = decompress_into(&out[..n], &mut decoded).unwrap();
+        assert_eq!(&decoded[..d], msg.as_slice());
+    }
+
+    #[test]
+    fn block_table_reuse_across_many_calls() {
+        let mut table = CompressTable::large();
+        for i in 0..100 {
+            let msg = format!("payload number {i} ").repeat(10).into_bytes();
+            let mut out = vec![0u8; get_maximum_output_size(msg.len())];
+            let n = compress_into_with_table(&msg, &mut out, &mut table).unwrap();
+            let mut decoded = vec![0u8; msg.len()];
+            let d = decompress_into(&out[..n], &mut decoded).unwrap();
+            assert_eq!(&decoded[..d], msg.as_slice());
+        }
+    }
+
+    #[test]
+    fn block_table_dict_round_trip() {
+        let dict = b"common log prefix: ".to_vec();
+        let mut table = CompressTable::large();
+        let msg = b"common log prefix: event=login user=alice".to_vec();
+
+        let mut out = vec![0u8; get_maximum_output_size(msg.len())];
+        let n =
+            compress_into_with_table_and_dict(&msg, &mut out, &mut table, &dict).unwrap();
+
+        let mut decoded = vec![0u8; msg.len()];
+        let d = decompress_into_with_dict(&out[..n], &mut decoded, &dict).unwrap();
+        assert_eq!(&decoded[..d], msg.as_slice());
+
+        // With-dict should be smaller than without on dict-sharing input.
+        let mut no_dict = CompressTable::large();
+        let mut out2 = vec![0u8; get_maximum_output_size(msg.len())];
+        let n2 = compress_into_with_table(&msg, &mut out2, &mut no_dict).unwrap();
+        assert!(n < n2, "dict compression should beat no-dict on shared-prefix input");
     }
 }
