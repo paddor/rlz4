@@ -11,66 +11,71 @@ describe RLZ4 do
     end
   end
 
-  describe ".compress / .decompress (frame format)" do
+  # Frame-format codec tests — these used to exercise the module-level
+  # RLZ4.compress / RLZ4.decompress, removed in 0.4. RLZ4::FrameCodec.new
+  # (no-dict) is now the canonical entry point for frame-format LZ4.
+  describe "RLZ4::FrameCodec (no dict)" do
+    let(:codec) { RLZ4::FrameCodec.new }
+
     it "round-trips an empty string" do
-      ct = RLZ4.compress("")
-      assert_equal "", RLZ4.decompress(ct)
+      ct = codec.compress("")
+      assert_equal "", codec.decompress(ct)
     end
 
     it "round-trips a single byte" do
-      ct = RLZ4.compress("x")
-      assert_equal "x", RLZ4.decompress(ct)
+      ct = codec.compress("x")
+      assert_equal "x", codec.decompress(ct)
     end
 
     it "round-trips ASCII text" do
       pt = "the quick brown fox jumps over the lazy dog"
-      assert_equal pt, RLZ4.decompress(RLZ4.compress(pt))
+      assert_equal pt, codec.decompress(codec.compress(pt))
     end
 
     it "round-trips highly repetitive input and actually compresses it" do
       pt = "A" * 100_000
-      ct = RLZ4.compress(pt)
+      ct = codec.compress(pt)
       assert_operator ct.bytesize, :<, pt.bytesize / 10
-      assert_equal pt, RLZ4.decompress(ct)
+      assert_equal pt, codec.decompress(ct)
     end
 
     it "round-trips random bytes (1 MiB)" do
       pt = Random.bytes(1_048_576)
-      assert_equal pt, RLZ4.decompress(RLZ4.compress(pt))
+      assert_equal pt, codec.decompress(codec.compress(pt))
     end
 
     it "round-trips binary data with NUL bytes" do
       pt = (0..255).map(&:chr).join * 16
       pt.force_encoding(Encoding::ASCII_8BIT)
-      assert_equal pt, RLZ4.decompress(RLZ4.compress(pt))
+      assert_equal pt, codec.decompress(codec.compress(pt))
     end
 
     it "emits the LZ4 frame magic number (04 22 4D 18)" do
-      ct = RLZ4.compress("anything")
+      ct = codec.compress("anything")
       assert_equal [0x04, 0x22, 0x4D, 0x18], ct.bytes.first(4)
     end
 
     it "returns binary-encoded output for compress" do
-      ct = RLZ4.compress("hello")
+      ct = codec.compress("hello")
       assert_equal Encoding::ASCII_8BIT, ct.encoding
     end
 
     it "returns binary-encoded output for decompress" do
-      pt = RLZ4.decompress(RLZ4.compress("hello"))
+      pt = codec.decompress(codec.compress("hello"))
       assert_equal Encoding::ASCII_8BIT, pt.encoding
     end
 
     it "raises DecompressError on garbage input" do
-      assert_raises(RLZ4::DecompressError) { RLZ4.decompress("not a valid lz4 frame") }
+      assert_raises(RLZ4::DecompressError) { codec.decompress("not a valid lz4 frame") }
     end
 
     it "raises DecompressError on truncated frame" do
-      ct = RLZ4.compress("some data that will compress")
-      assert_raises(RLZ4::DecompressError) { RLZ4.decompress(ct[0, ct.bytesize / 2]) }
+      ct = codec.compress("some data that will compress")
+      assert_raises(RLZ4::DecompressError) { codec.decompress(ct[0, ct.bytesize / 2]) }
     end
 
     it "raises DecompressError on empty input" do
-      assert_raises(RLZ4::DecompressError) { RLZ4.decompress("") }
+      assert_raises(RLZ4::DecompressError) { codec.decompress("") }
     end
 
     it "DecompressError is a StandardError subclass" do
@@ -80,6 +85,7 @@ describe RLZ4 do
 
   describe "DoS resistance" do
     it "does not allocate a large output String on failed decompress" do
+      codec   = RLZ4::FrameCodec.new
       size    = 1_048_576
       garbage = "\x00".b * size
 
@@ -87,7 +93,7 @@ describe RLZ4 do
       before = ObjectSpace.each_object(String).count { |s| s.bytesize >= size }
 
       10.times do
-        assert_raises(RLZ4::DecompressError) { RLZ4.decompress(garbage) }
+        assert_raises(RLZ4::DecompressError) { codec.decompress(garbage) }
       end
 
       GC.start
@@ -99,18 +105,87 @@ describe RLZ4 do
   end
 
   describe RLZ4::Dictionary do
-    let(:dict) { "header version=1 type=message field1=" }
-    let(:d)    { RLZ4::Dictionary.new(dict) }
+    let(:bytes) { "header version=1 type=message field1=" }
 
-    it "reports its size" do
-      assert_equal dict.bytesize, d.size
+    it "stores bytes binary-encoded and frozen" do
+      d = RLZ4::Dictionary.new(bytes: bytes)
+      assert_equal bytes.b, d.bytes
+      assert_predicate d.bytes, :frozen?
+      assert_equal Encoding::ASCII_8BIT, d.bytes.encoding
     end
 
-    it "exposes a stable Dict_ID derived from sha256(dict)[0..4] LE" do
-      require "digest"
-      expected = Digest::SHA256.digest(dict)[0, 4].unpack1("V")
-      assert_equal expected, d.id
-      assert_equal d.id, RLZ4::Dictionary.new(dict.dup).id
+    it "defaults id to sha256(bytes)[0, 4] interpreted LE" do
+      expected = Digest::SHA256.digest(bytes)[0, 4].unpack1("V")
+      assert_equal expected, RLZ4::Dictionary.new(bytes: bytes).id
+    end
+
+    it "accepts a caller-supplied id: kwarg" do
+      d = RLZ4::Dictionary.new(bytes: bytes, id: 0xDEAD_BEEF)
+      assert_equal 0xDEAD_BEEF, d.id
+    end
+
+    it "#size reports dict size in bytes" do
+      assert_equal bytes.bytesize, RLZ4::Dictionary.new(bytes: bytes).size
+    end
+
+    it "inherits Data's immutability and value equality" do
+      assert_predicate RLZ4::Dictionary.new(bytes: bytes), :frozen?
+      assert_equal(
+        RLZ4::Dictionary.new(bytes: bytes),
+        RLZ4::Dictionary.new(bytes: bytes.dup),
+      )
+      assert_equal(
+        RLZ4::Dictionary.new(bytes: bytes).hash,
+        RLZ4::Dictionary.new(bytes: bytes.dup).hash,
+      )
+    end
+
+    it "is shareable across Ractors" do
+      r = Ractor.new(RLZ4::Dictionary.new(bytes: bytes)) { |d| [d.bytes, d.id] }
+      got_bytes, got_id = r.value
+      assert_equal bytes.b, got_bytes
+      assert_equal Digest::SHA256.digest(bytes)[0, 4].unpack1("V"), got_id
+    end
+  end
+
+  describe RLZ4::FrameCodec do
+    let(:dict_bytes) { "header version=1 type=message field1=" }
+    let(:dict)       { RLZ4::Dictionary.new(bytes: dict_bytes) }
+    let(:d)          { RLZ4::FrameCodec.new(dict: dict) }
+    let(:no_dict)    { RLZ4::FrameCodec.new }
+
+    it ".new without a dict accepts compress/decompress round-trips" do
+      msg = "the quick brown fox jumps over the lazy dog"
+      ct  = no_dict.compress(msg)
+      assert_equal [0x04, 0x22, 0x4D, 0x18], ct.bytes.first(4)
+      assert_equal msg, no_dict.decompress(ct)
+    end
+
+    it ".new(dict: Dictionary) uses the Dictionary's cached id" do
+      assert_equal dict.id, d.id
+    end
+
+    it ".new(dict: String) also works and derives the id on the fly" do
+      c = RLZ4::FrameCodec.new(dict: dict_bytes)
+      assert_equal dict.id, c.id
+    end
+
+    it ".new raises TypeError for other dict arg types" do
+      assert_raises(TypeError) { RLZ4::FrameCodec.new(dict: 42) }
+    end
+
+    it "#has_dict? reflects construction" do
+      assert_predicate d,       :has_dict?
+      refute_predicate no_dict, :has_dict?
+    end
+
+    it "#size is dict size or 0" do
+      assert_equal dict_bytes.bytesize, d.size
+      assert_equal 0, no_dict.size
+    end
+
+    it "#id is nil without a dict" do
+      assert_nil no_dict.id
     end
 
     it "emits a real LZ4 frame with the magic number" do
@@ -119,8 +194,8 @@ describe RLZ4 do
     end
 
     it "raises DecompressError on dict id mismatch" do
-      d2  = RLZ4::Dictionary.new("totally different dictionary payload")
-      ct  = d.compress("header version=1 type=message field1=hello")
+      d2 = RLZ4::FrameCodec.new(dict: "totally different dictionary payload")
+      ct = d.compress("header version=1 type=message field1=hello")
       assert_raises(RLZ4::DecompressError) { d2.decompress(ct) }
     end
 
@@ -140,16 +215,14 @@ describe RLZ4 do
       assert_equal "", d.decompress(ct)
     end
 
-
     it "raises DecompressError on garbage input" do
       assert_raises(RLZ4::DecompressError) { d.decompress("garbage") }
     end
 
     it "compresses small messages with a dict more efficiently than without" do
-      # A message that is mostly dict prefix should compress very small with the dict.
-      msg        = dict + "payload"
+      msg        = dict_bytes + "payload"
       ct_with    = d.compress(msg)
-      ct_without = RLZ4.compress(msg)
+      ct_without = no_dict.compress(msg)
       assert_operator ct_with.bytesize, :<, ct_without.bytesize
     end
   end
@@ -399,20 +472,21 @@ describe RLZ4 do
   describe "Ractor safety" do
     it "compresses and decompresses inside a Ractor" do
       r = Ractor.new do
-        pt = "hello from inside a ractor " * 100
-        ct = RLZ4.compress(pt)
-        [ct.bytesize, RLZ4.decompress(ct) == pt]
+        codec = RLZ4::FrameCodec.new
+        pt    = "hello from inside a ractor " * 100
+        ct    = codec.compress(pt)
+        [ct.bytesize, codec.decompress(ct) == pt]
       end
       size, ok = r.value
       assert_equal true, ok
       assert_operator size, :>, 0
     end
 
-    it "passes a Dictionary to a Ractor (must be shareable)" do
-      # The Dictionary wraps an immutable byte buffer and is marked Send+Sync
+    it "passes a FrameCodec to a Ractor (must be shareable)" do
+      # FrameCodec wraps an immutable byte buffer and is marked Send+Sync
       # on the Rust side, which is what makes this gem Ractor-safe.
       r = Ractor.new do
-        d   = RLZ4::Dictionary.new("shared dict prefix ")
+        d   = RLZ4::FrameCodec.new(dict: "shared dict prefix ")
         msg = "shared dict prefix body"
         ct  = d.compress(msg)
         d.decompress(ct) == msg
@@ -443,10 +517,11 @@ describe RLZ4 do
     it "multiple Ractors compress in parallel without crashing" do
       ractors = 4.times.map do |i|
         Ractor.new(i) do |idx|
-          pt = "ractor #{idx} payload " * 1000
+          codec = RLZ4::FrameCodec.new
+          pt    = "ractor #{idx} payload " * 1000
           1000.times do
-            ct = RLZ4.compress(pt)
-            raise "mismatch in ractor #{idx}" unless RLZ4.decompress(ct) == pt
+            ct = codec.compress(pt)
+            raise "mismatch in ractor #{idx}" unless codec.decompress(ct) == pt
           end
           :ok
         end

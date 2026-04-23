@@ -27,137 +27,110 @@ gem "rlz4"
 
 Building requires a Rust toolchain (stable).
 
-## Usage
+## API
 
-### Frame format (module functions)
+Three classes plus one utility module function:
+
+| | Purpose | Wire format |
+|---|---|---|
+| `RLZ4::Dictionary` | Value type: dict bytes + 4-byte id | — |
+| `RLZ4::FrameCodec` | Optionally dict-bound frame codec | LZ4 frame (`04 22 4D 18`), interoperable with `lz4` CLI |
+| `RLZ4::BlockCodec` | Optionally dict-bound block codec, reusable scratch | Raw LZ4 block, no framing |
+| `RLZ4.compress_bound(n)` | Worst-case output size for input size `n` | — |
+
+Invalid input on decompress raises `RLZ4::DecompressError`
+(a `StandardError` subclass).
+
+## RLZ4::Dictionary
+
+Pure value type — just the dict bytes plus a 4-byte id. Built on
+`Data.define`, so it's immutable, has value equality, and is
+shareable across `Ractor`s. The id defaults to `sha256(bytes)[0, 4]`
+interpreted little-endian (the derivation LZ4 frame `FLG.DictID`
+uses); override with `id:` if you need a coordinated value.
 
 ```ruby
-require "rlz4"
+dict = RLZ4::Dictionary.new(bytes: "schema=v1 type=message field1=")
+dict.bytes  # => "schema=v1..." frozen binary
+dict.id     # => u32
+dict.size   # => 30
 
-compressed   = RLZ4.compress_frame("hello world" * 100)
-decompressed = RLZ4.decompress_frame(compressed)
-
-# Wire format is standard LZ4 frame (magic number 04 22 4D 18),
-# interoperable with any other LZ4 frame implementation.
+# With a caller-supplied id (e.g. from an out-of-band protocol):
+custom = RLZ4::Dictionary.new(bytes: raw, id: 0xDEAD_BEEF)
 ```
 
-`RLZ4.compress` / `RLZ4.decompress` are kept as aliases for
-`compress_frame` / `decompress_frame` and will be removed in 0.4.
+## RLZ4::FrameCodec — frame-format LZ4
 
-Invalid input raises `RLZ4::DecompressError` (a `StandardError` subclass):
+Emits a real LZ4 frame (magic `04 22 4D 18`), interoperable with the
+`lz4` CLI. With a dictionary, sets `FLG.DictID` and writes `Dict_ID`
+into the FrameDescriptor — a receiver routing by id can pick the
+right dict from a set purely by parsing the frame header.
+
+Stateless (no scratch), so `FrameCodec` instances are shareable
+across `Ractor`s.
 
 ```ruby
-begin
-  RLZ4.decompress_frame("not a valid lz4 frame")
-rescue RLZ4::DecompressError => e
-  warn e.message
-end
+codec = RLZ4::FrameCodec.new                           # no dict
+codec = RLZ4::FrameCodec.new(dict: dict)               # Dictionary value
+codec = RLZ4::FrameCodec.new(dict: "raw bytes here")   # String shortcut
+
+ct = codec.compress("hello world" * 100)
+pt = codec.decompress(ct)
+
+codec.has_dict?  # => true / false
+codec.id         # => u32 id when dict-bound, nil otherwise
+codec.size       # => dict size when dict-bound, 0 otherwise
 ```
 
-### Block format (stateful codec)
+Dict id mismatch on decompress raises `RLZ4::DecompressError`
+before touching the payload — no silently corrupt output.
+
+## RLZ4::BlockCodec — block-format LZ4
 
 For hot paths that compress many small messages and want to amortise
-allocation, use `RLZ4::BlockCodec`. It wraps a reusable scratch hash
-table and emits raw LZ4 blocks — no frame header, no end-mark, no
-checksum. Not interoperable with the reference `lz4` CLI, meant for
-callers who carry their own framing (e.g. ZMTP transports).
+allocation. Emits a raw LZ4 block — no frame header, no end-mark,
+no checksum. Not interoperable with the reference `lz4` CLI; meant
+for callers who carry their own framing (e.g. ZMTP transports).
+
+Wraps a reusable 16 KiB scratch hash table. With a dictionary, also
+carries a pristine dict-loaded table and restores it into the scratch
+via a single 16 KiB `memcpy` before each compress call — so dict
+initialisation is paid once at construction, not per call.
 
 ```ruby
-codec = RLZ4::BlockCodec.new
+codec = RLZ4::BlockCodec.new                           # no dict
+codec = RLZ4::BlockCodec.new(dict: dict)               # Dictionary value
+codec = RLZ4::BlockCodec.new(dict: "raw bytes here")   # String shortcut
 
-msg = "small message " * 8
-ct  = codec.compress(msg)
-pt  = codec.decompress(ct, decompressed_size: msg.bytesize)
+ct = codec.compress("hello world" * 100)
+pt = codec.decompress(ct, decompressed_size: 1100)
 ```
-
-For a **shared dictionary**, pass it at construction time. The dict
-is hashed into a pristine table exactly once; every subsequent
-`#compress` call restores the pristine state via a 16 KiB `memcpy`.
-This amortises dict initialisation across the codec's lifetime
-instead of paying ~3–5 µs per call to re-hash the dict.
-
-```ruby
-codec = RLZ4::BlockCodec.new(dict: "common log prefix: ")
-ct = codec.compress("common log prefix: event=login user=alice")
-pt = codec.decompress(ct, decompressed_size: ct.bytesize)
-```
-
-The dict is a permanent property of the codec. To change dicts, build
-a fresh codec. The peer on the other end must construct its codec
-with the same dict bytes.
 
 `#decompress` requires `decompressed_size:` because raw LZ4 blocks
-carry no length prefix, and uses it as a hard upper bound on output
-size. Crafted inputs that try to write more than `decompressed_size`
-raise `RLZ4::DecompressError`.
+carry no length prefix. The decoder refuses to write past that
+value even on crafted malformed input — raises
+`RLZ4::DecompressError` on any overrun.
 
 Use `RLZ4.compress_bound(n)` to pre-size output buffers.
 
-`BlockCodec` is thread-local — **do not cross `Ractor` boundaries**.
-Allocate one codec per `Ractor`.
+`BlockCodec` holds a `RefCell` internally and is **thread-local** —
+do not cross `Ractor` boundaries. Allocate one per `Ractor`. The
+block format has no on-wire `Dict_ID` field; a dict mismatch
+produces garbage plaintext (not an error). Detect at a higher
+layer (checksum, schema validation, etc.).
 
-### Dictionary compression
+## Ractor safety
 
-For workloads where many small messages share a common prefix (e.g. ZMQ
-messages with a fixed header), a shared dictionary massively improves the
-compression ratio. `RLZ4::Dictionary#compress` emits a **real LZ4 frame**
-(magic `04 22 4D 18`) with the `FLG.DictID` bit set and the dictionary's
-`Dict_ID` written into the FrameDescriptor — interoperable with the
-reference `lz4` CLI given the same dictionary file (`lz4 -d -D dict.bin`).
-
-```ruby
-dict = RLZ4::Dictionary.new("schema=v1 type=message field1=")
-
-compressed   = dict.compress("schema=v1 type=message field1=payload")
-decompressed = dict.decompress(compressed)
-
-dict.size  # => 30
-dict.id    # => u32 Dict_ID
-```
-
-`RLZ4::Dictionary` is immutable after construction and can be shared across
-Ractors.
-
-## Dictionary IDs
-
-`Dictionary#id` is a `u32` derived from `sha256(dict_bytes)[0..4]`
-interpreted little-endian. The LZ4 frame spec defines `Dict_ID` as
-an application-defined field with no reserved ranges and no central
-registrar, so the full `u32` space is usable.
-
-The id **is on the wire**: `Dictionary#compress` sets `FLG.DictID = 1`
-and writes the id into the FrameDescriptor. On decode, `rlz4` parses
-the incoming frame's `Dict_ID` and asserts it matches
-`Dictionary#id` before touching the payload. Receivers that maintain
-multiple dictionaries can therefore route incoming frames to the
-right one purely by parsing the frame header — no out-of-band id
-channel needed.
-
-LZ4 dictionaries are always raw bytes (unlike Zstd, there is no
-dict-file header format), so there is no header to parse an id out
-of. If you need sender and receiver to agree on an id without
-shipping it out-of-band, deriving it deterministically from the
-dict bytes — which is what `Dictionary.new` does — is the simplest
-option.
-
-Dictionary training from a sample corpus is **not supported**: LZ4
-has no equivalent of Zstd's `ZDICT_trainFromBuffer`. Dictionaries
-are supplied by the caller as raw bytes (typically a hand-picked
-prefix or a representative message).
-
-### Ractors
-
-Module functions and `RLZ4::Dictionary` can be used from any Ractor.
-**`RLZ4::BlockCodec` cannot cross Ractor boundaries** — allocate one
-per Ractor. Example from the test suite:
+`Dictionary` and `FrameCodec` can be used from any `Ractor`. Example:
 
 ```ruby
 ractors = 4.times.map do |i|
   Ractor.new(i) do |idx|
-    pt = "ractor #{idx} payload " * 1000
+    codec = RLZ4::FrameCodec.new
+    pt    = "ractor #{idx} payload " * 1000
     1000.times do
-      ct = RLZ4.compress_frame(pt)
-      raise "mismatch" unless RLZ4.decompress_frame(ct) == pt
+      ct = codec.compress(pt)
+      raise "mismatch" unless codec.decompress(ct) == pt
     end
     :ok
   end
@@ -165,11 +138,17 @@ end
 ractors.map(&:value) # => [:ok, :ok, :ok, :ok]
 ```
 
+`BlockCodec` must not cross `Ractor` boundaries — allocate one per
+`Ractor`.
+
 ## Non-goals
 
 - High-compression mode (LZ4_HC).
 - Streaming / chunked compression.
 - Preservation of string encoding on decompress (output is always binary).
+- Dictionary training from a sample corpus. LZ4 has no equivalent of
+  Zstd's `ZDICT_trainFromBuffer`. Dictionaries are caller-supplied
+  raw bytes.
 
 ## License
 

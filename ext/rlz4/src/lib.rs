@@ -29,66 +29,7 @@ fn decompress_error(ruby: &Ruby) -> ExceptionClass {
     )
 }
 
-// ---------- module functions: frame-format compress/decompress ----------
-//
-// These are the v0.1/v0.2 API, renamed in 0.3 to `compress_frame` /
-// `decompress_frame` to make room for block-format primitives on the
-// module surface. The old names are kept as aliases for one release
-// cycle.
-
-fn rlz4_compress_frame(ruby: &Ruby, rb_input: RString) -> Result<RString, Error> {
-    // SAFETY: borrow the RString's bytes directly. Ruby GC won't move
-    // `rb_input` during this function; `FrameEncoder::write_all` /
-    // `finish` allocate Rust Vecs only, no Ruby callbacks.
-    let input: &[u8] = unsafe { rb_input.as_slice() };
-
-    // Pre-size the output buffer. Frame overhead is ~19 bytes for the header
-    // plus up to ~4 bytes per block end-marker — 64 is a comfortable ceiling.
-    let upper = get_maximum_output_size(input.len()) + 64;
-    let mut encoder = FrameEncoder::new(Vec::with_capacity(upper));
-    encoder.write_all(input).map_err(|e| {
-        Error::new(
-            ruby.exception_runtime_error(),
-            format!("lz4 frame encoder write failed: {e}"),
-        )
-    })?;
-    let compressed = encoder.finish().map_err(|e| {
-        Error::new(
-            ruby.exception_runtime_error(),
-            format!("lz4 frame encoder finish failed: {e}"),
-        )
-    })?;
-
-    Ok(ruby.str_from_slice(&compressed))
-}
-
-fn rlz4_decompress_frame(ruby: &Ruby, rb_input: RString) -> Result<RString, Error> {
-    // SAFETY: borrow the RString's bytes directly. See rlz4_compress_frame.
-    let compressed: &[u8] = unsafe { rb_input.as_slice() };
-
-    // Reject anything that isn't a well-formed frame up front. lz4_flex's
-    // FrameDecoder permissively returns Ok for zero-length input, which would
-    // quietly mask "sender forgot --compress" mistakes in omq-cli.
-    if compressed.len() < LZ4_FRAME_MAGIC.len() || compressed[..4] != LZ4_FRAME_MAGIC {
-        return Err(Error::new(
-            decompress_error(ruby),
-            "lz4 frame decode failed: bad magic (input is not an LZ4 frame)",
-        ));
-    }
-
-    // Decode into a local Vec first. If this fails, we never allocate a
-    // Ruby string — important for DoS-resistance against malformed input.
-    let mut decoder = FrameDecoder::new(compressed);
-    let mut out = Vec::new();
-    decoder.read_to_end(&mut out).map_err(|e| {
-        Error::new(
-            decompress_error(ruby),
-            format!("lz4 frame decode failed: {e}"),
-        )
-    })?;
-
-    Ok(ruby.str_from_slice(&out))
-}
+// ---------- module function: compress_bound ----------
 
 fn rlz4_compress_bound(_ruby: &Ruby, size: usize) -> Result<usize, Error> {
     Ok(get_maximum_output_size(size))
@@ -231,63 +172,103 @@ fn block_codec_decompress(
     Ok(ruby.str_from_slice(&out))
 }
 
-// ---------- Dictionary: dict-bound LZ4 frame compression ----------
+// ---------- FrameCodec: LZ4 frame-format codec, optionally dict-bound ----------
 //
-// Backed by lz4_flex's `FrameEncoder::with_dictionary` /
-// `FrameDecoder::with_dictionary` (added in our fork). Output is a real
-// LZ4 frame with the FLG.DictID bit set and `Dict_ID` written into the
-// FrameDescriptor — interoperable with the reference `lz4` CLI given the
-// same dictionary file.
+// Parallel to BlockCodec (block format). Output is a real LZ4 frame —
+// magic `04 22 4D 18`. When constructed with a dict, sets FLG.DictID
+// and writes `Dict_ID` into the FrameDescriptor; the dict is stored
+// once and consulted on every compress/decompress call.
+//
+// Backed by lz4_flex's `FrameEncoder` / `FrameEncoder::with_dictionary`
+// and `FrameDecoder` / `FrameDecoder::with_dictionary`.
 //
 // `Dict_ID` is supplied by the caller (the Ruby wrapper in `lib/rlz4.rb`
 // derives it from `sha256(dict_bytes)[0..4]` interpreted little-endian).
 // Doing the digest in Ruby keeps a hash crate out of the Rust extension's
 // dependency tree.
-#[magnus::wrap(class = "RLZ4::Dictionary", free_immediately, size)]
-struct Dictionary {
+#[magnus::wrap(class = "RLZ4::FrameCodec", free_immediately, size)]
+struct FrameCodec {
+    dict: Option<DictBound>,
+}
+
+struct DictBound {
     bytes: Vec<u8>,
     id: u32,
 }
 
-// Safety: Dictionary is read-only after construction (just a byte buffer
-// plus a derived id). No interior mutability, no thread-local refs.
-unsafe impl Send for Dictionary {}
-unsafe impl Sync for Dictionary {}
+// Safety: FrameCodec is read-only after construction (dict bytes + id
+// or no dict). No interior mutability, no thread-local refs. Shareable
+// across Ractors.
+unsafe impl Send for FrameCodec {}
+unsafe impl Sync for FrameCodec {}
 
-fn dict_initialize(_ruby: &Ruby, rb_dict: RString, id: u32) -> Result<Dictionary, Error> {
-    // SAFETY: copy bytes into an owned Vec before any Ruby allocation.
-    let bytes: Vec<u8> = unsafe { rb_dict.as_slice().to_vec() };
-    rb_dict.freeze();
-    Ok(Dictionary { bytes, id })
+fn frame_codec_initialize(
+    _ruby: &Ruby,
+    rb_dict: Option<RString>,
+    id: u32,
+) -> Result<FrameCodec, Error> {
+    let dict = rb_dict.map(|s| {
+        // SAFETY: copy dict bytes into an owned Vec before any Ruby
+        // allocation. Codec holds them for its lifetime.
+        let bytes: Vec<u8> = unsafe { s.as_slice().to_vec() };
+        s.freeze();
+        DictBound { bytes, id }
+    });
+    Ok(FrameCodec { dict })
 }
 
-fn dict_compress(ruby: &Ruby, rb_self: &Dictionary, rb_input: RString) -> Result<RString, Error> {
+fn frame_codec_compress(
+    ruby: &Ruby,
+    rb_self: &FrameCodec,
+    rb_input: RString,
+) -> Result<RString, Error> {
     // SAFETY: borrow the RString's bytes directly. See rlz4_compress_frame.
     let input: &[u8] = unsafe { rb_input.as_slice() };
     let upper = get_maximum_output_size(input.len()) + 64;
-    let mut encoder = lz4_flex::frame::FrameEncoder::with_dictionary(
-        Vec::with_capacity(upper),
-        &rb_self.bytes,
-        rb_self.id,
-    );
-    encoder.write_all(input).map_err(|e| {
-        Error::new(
-            ruby.exception_runtime_error(),
-            format!("lz4 dict frame encode write failed: {e}"),
-        )
-    })?;
-    let compressed = encoder.finish().map_err(|e| {
-        Error::new(
-            ruby.exception_runtime_error(),
-            format!("lz4 dict frame encode finish failed: {e}"),
-        )
-    })?;
+
+    let compressed = match &rb_self.dict {
+        None => {
+            let mut encoder = FrameEncoder::new(Vec::with_capacity(upper));
+            encoder.write_all(input).map_err(|e| {
+                Error::new(
+                    ruby.exception_runtime_error(),
+                    format!("lz4 frame encoder write failed: {e}"),
+                )
+            })?;
+            encoder.finish().map_err(|e| {
+                Error::new(
+                    ruby.exception_runtime_error(),
+                    format!("lz4 frame encoder finish failed: {e}"),
+                )
+            })?
+        }
+        Some(d) => {
+            let mut encoder = lz4_flex::frame::FrameEncoder::with_dictionary(
+                Vec::with_capacity(upper),
+                &d.bytes,
+                d.id,
+            );
+            encoder.write_all(input).map_err(|e| {
+                Error::new(
+                    ruby.exception_runtime_error(),
+                    format!("lz4 dict frame encode write failed: {e}"),
+                )
+            })?;
+            encoder.finish().map_err(|e| {
+                Error::new(
+                    ruby.exception_runtime_error(),
+                    format!("lz4 dict frame encode finish failed: {e}"),
+                )
+            })?
+        }
+    };
+
     Ok(ruby.str_from_slice(&compressed))
 }
 
-fn dict_decompress(
+fn frame_codec_decompress(
     ruby: &Ruby,
-    rb_self: &Dictionary,
+    rb_self: &FrameCodec,
     rb_input: RString,
 ) -> Result<RString, Error> {
     // SAFETY: borrow the RString's bytes directly. See rlz4_compress_frame.
@@ -295,31 +276,49 @@ fn dict_decompress(
     if compressed.len() < LZ4_FRAME_MAGIC.len() || compressed[..4] != LZ4_FRAME_MAGIC {
         return Err(Error::new(
             decompress_error(ruby),
-            "lz4 dict frame decode failed: bad magic (input is not an LZ4 frame)",
+            "lz4 frame decode failed: bad magic (input is not an LZ4 frame)",
         ));
     }
 
-    let mut decoder = lz4_flex::frame::FrameDecoder::with_dictionary(
-        compressed,
-        &rb_self.bytes,
-        rb_self.id,
-    );
     let mut out = Vec::new();
-    decoder.read_to_end(&mut out).map_err(|e| {
-        Error::new(
-            decompress_error(ruby),
-            format!("lz4 dict frame decode failed: {e}"),
-        )
-    })?;
+    match &rb_self.dict {
+        None => {
+            let mut decoder = FrameDecoder::new(compressed);
+            decoder.read_to_end(&mut out).map_err(|e| {
+                Error::new(
+                    decompress_error(ruby),
+                    format!("lz4 frame decode failed: {e}"),
+                )
+            })?;
+        }
+        Some(d) => {
+            let mut decoder = lz4_flex::frame::FrameDecoder::with_dictionary(
+                compressed,
+                &d.bytes,
+                d.id,
+            );
+            decoder.read_to_end(&mut out).map_err(|e| {
+                Error::new(
+                    decompress_error(ruby),
+                    format!("lz4 dict frame decode failed: {e}"),
+                )
+            })?;
+        }
+    }
+
     Ok(ruby.str_from_slice(&out))
 }
 
-fn dict_size(rb_self: &Dictionary) -> usize {
-    rb_self.bytes.len()
+fn frame_codec_size(rb_self: &FrameCodec) -> usize {
+    rb_self.dict.as_ref().map_or(0, |d| d.bytes.len())
 }
 
-fn dict_id(rb_self: &Dictionary) -> u32 {
-    rb_self.id
+fn frame_codec_has_dict(rb_self: &FrameCodec) -> bool {
+    rb_self.dict.is_some()
+}
+
+fn frame_codec_id(rb_self: &FrameCodec) -> Option<u32> {
+    rb_self.dict.as_ref().map(|d| d.id)
 }
 
 // ---------- module init ----------
@@ -340,10 +339,6 @@ fn init(ruby: &Ruby) -> Result<(), Error> {
         .set(Opaque::from(decompress_error_class))
         .unwrap_or_else(|_| panic!("init called more than once"));
 
-    // Frame-format module functions (renamed in 0.3; old names kept as
-    // aliases in lib/rlz4.rb for one release cycle).
-    module.define_module_function("compress_frame", function!(rlz4_compress_frame, 1))?;
-    module.define_module_function("decompress_frame", function!(rlz4_decompress_frame, 1))?;
     module.define_module_function("compress_bound", function!(rlz4_compress_bound, 1))?;
 
     // Block-format codec: stateful encoder (reusable scratch table, with
@@ -357,14 +352,16 @@ fn init(ruby: &Ruby) -> Result<(), Error> {
     codec_class.define_method("compress", method!(block_codec_compress, 1))?;
     codec_class.define_method("_decompress", method!(block_codec_decompress, 2))?;
 
-    let dict_class = module.define_class("Dictionary", ruby.class_object())?;
-    // Bound as `_native_new(bytes, id)`. Ruby's `RLZ4::Dictionary.new(bytes)`
-    // computes the id and forwards — see `lib/rlz4.rb`.
-    dict_class.define_singleton_method("_native_new", function!(dict_initialize, 2))?;
-    dict_class.define_method("compress", method!(dict_compress, 1))?;
-    dict_class.define_method("decompress", method!(dict_decompress, 1))?;
-    dict_class.define_method("size", method!(dict_size, 0))?;
-    dict_class.define_method("id", method!(dict_id, 0))?;
+    let frame_codec_class = module.define_class("FrameCodec", ruby.class_object())?;
+    // Bound as `_native_new(dict_or_nil, id)`. Ruby's
+    // `RLZ4::FrameCodec.new(dict: bytes)` computes the id and forwards
+    // — see `lib/rlz4.rb`.
+    frame_codec_class.define_singleton_method("_native_new", function!(frame_codec_initialize, 2))?;
+    frame_codec_class.define_method("compress", method!(frame_codec_compress, 1))?;
+    frame_codec_class.define_method("decompress", method!(frame_codec_decompress, 1))?;
+    frame_codec_class.define_method("size", method!(frame_codec_size, 0))?;
+    frame_codec_class.define_method("has_dict?", method!(frame_codec_has_dict, 0))?;
+    frame_codec_class.define_method("id", method!(frame_codec_id, 0))?;
 
     Ok(())
 }

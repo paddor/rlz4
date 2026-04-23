@@ -1,5 +1,49 @@
 # Changelog
 
+## 0.4.0 (2026-04-23)
+
+### Breaking
+
+- **`RLZ4::Dictionary` is now a value type, not a codec.** The old
+  dict-bound frame-format compressor (which confusingly called
+  itself "Dictionary") is replaced by a new `RLZ4::FrameCodec` class.
+  `Dictionary` becomes a pure `Data.define` value holding `bytes` and
+  `id`, immutable and shareable across Ractors. No backward-compat
+  shim; callers must migrate from `RLZ4::Dictionary.new(bytes)` to
+  `RLZ4::FrameCodec.new(dict: bytes)` (or construct a Dictionary
+  value and pass it: `FrameCodec.new(dict: Dictionary.new(bytes: ...))`).
+- **Module-level `RLZ4.compress` / `.decompress` / `.compress_frame` /
+  `.decompress_frame` removed.** Use `RLZ4::FrameCodec.new.compress`
+  and `.decompress` instead. `RLZ4.compress_bound` stays (utility,
+  not a compress/decompress operation).
+- **`BlockCodec.new(dict:)` and `FrameCodec.new(dict:)`** now accept
+  a `Dictionary`, a `String`, or `nil`. A `Dictionary` reuses its
+  cached id; a `String` derives the id on the fly. Anything else
+  raises `TypeError`.
+
+### Added
+
+- **`RLZ4::Dictionary`** — `Data.define(:bytes, :id)` value type.
+  `.new(bytes:, id: Digest::SHA256.digest(bytes).byteslice(0, 4).unpack1("V"))`.
+  Inherits `==` / `#hash` / `#deconstruct` from `Data`. Frozen after
+  construction, binary-encoded bytes, shareable across Ractors. `#size`
+  reports dict size in bytes.
+- **`RLZ4::FrameCodec`** — frame-format LZ4 codec, optionally
+  dict-bound. Parallels `BlockCodec`'s shape. Stateless (no scratch
+  table), shareable across Ractors.
+  - `.new(dict: nil)` — plain frame codec.
+  - `.new(dict: Dictionary | String)` — dict-bound; writes `FLG.DictID`
+    and `Dict_ID` into the FrameDescriptor. Mismatched id on decode
+    raises `DecompressError` before touching the payload.
+  - `#compress(bytes)` / `#decompress(bytes)` / `#has_dict?` /
+    `#size` / `#id`.
+
+### Changed
+
+- **File layout.** Ruby-side classes split into their own files under
+  `lib/rlz4/`: `dictionary.rb`, `block_codec.rb`, `frame_codec.rb`.
+  `lib/rlz4.rb` is now just the top-level require list.
+
 ## 0.3.0 (2026-04-23)
 
 ### Added
