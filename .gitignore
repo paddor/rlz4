@@ -1,3 +1,5 @@
+/.cla*
+/CLA*
 /Gemfile.lock
 /pkg/
 /coverage/
