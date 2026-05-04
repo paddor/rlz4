@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.5.1 (2026-05-04)
+
+- make clippy happy
+
 ## 0.5.0 (2026-05-04)
 
 - port to lz4_sys (PR https://github.com/PSeitz/lz4_flex/pull/218 is taking too long)
