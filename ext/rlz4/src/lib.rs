@@ -471,10 +471,7 @@ fn frame_codec_decompress(
     // use a fresh context for the actual decompress so LZ4F_decompress_usingDict
     // sees dstage_init and correctly installs the dict.
     if let Some(d) = &rb_self.dict {
-        let temp_ctx = match create_dctx(ruby) {
-            Ok(c) => c,
-            Err(e) => return Err(e),
-        };
+        let temp_ctx = create_dctx(ruby)?;
         let mut frame_info = zero_frame_info();
         let mut dummy = compressed.len();
         let ret = unsafe {
@@ -501,10 +498,7 @@ fn frame_codec_decompress(
     }
 
     // Fresh context for actual decompression.
-    let ctx = match create_dctx(ruby) {
-        Ok(c) => c,
-        Err(e) => return Err(e),
-    };
+    let ctx = create_dctx(ruby)?;
 
     // Pass the full compressed buffer (including header) to the loop.
     // LZ4F_decompress_usingDict sets the dict before parsing the header
