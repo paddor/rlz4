@@ -298,8 +298,8 @@ describe RLZ4 do
         end
       end
 
-      it "reports its size as one 16 KiB table" do
-        assert_equal 16_384, codec.size
+      it "reports its size as 0 (LZ4_compress_fast is stateless)" do
+        assert_equal 0, codec.size
       end
     end
 
@@ -350,8 +350,8 @@ describe RLZ4 do
         end
       end
 
-      it "reports its size as two 16 KiB tables plus dict bytes" do
-        assert_equal 16_384 + 16_384 + dict.bytesize, codec.size
+      it "reports its size as one lz4 stream plus dict bytes" do
+        assert_equal RLZ4.block_stream_size + dict.bytesize, codec.size
       end
     end
 
