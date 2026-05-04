@@ -8,13 +8,12 @@ Gem::Specification.new do |spec|
   spec.authors       = ["Patrik Wenger"]
   spec.email         = ["paddor@protonmail.ch"]
 
-  spec.summary       = "Ractor-safe LZ4 bindings for Ruby (Rust extension via lz4_flex)"
+  spec.summary       = "Ractor-safe LZ4 bindings for Ruby (Rust extension via lz4-sys/liblz4)"
   spec.description   = <<~DESC
-    Ruby bindings (via Rust/magnus) for the lz4_flex LZ4 implementation.
-    Provides LZ4 frame-format compress/decompress at module level and a
-    stateful Dictionary class for block-format compression with a shared
-    dictionary. Designed to be safe to call from multiple Ractors, unlike
-    existing Ruby LZ4 gems.
+    Ruby bindings (via Rust/magnus) for liblz4, using lz4-sys FFI.
+    Provides block-format and frame-format LZ4 compress/decompress with
+    optional dictionary support. Designed to be safe to call from multiple
+    Ractors, unlike existing Ruby LZ4 gems.
   DESC
   spec.homepage      = "https://github.com/paddor/rlz4"
   spec.license       = "MIT"
@@ -27,7 +26,8 @@ Gem::Specification.new do |spec|
   spec.files = Dir[
     "lib/**/*.rb",
     "ext/**/*.{rs,rb}",
-    "**/Cargo.toml",
+    "ext/**/Cargo.toml",
+    "Cargo.toml",
     "Cargo.lock",
     "LICENSE",
     "README.md"
